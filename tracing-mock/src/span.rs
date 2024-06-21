@@ -94,7 +94,13 @@
 use crate::{
     expect, field::ExpectedFields, metadata::ExpectedMetadata, subscriber::SpanState, Parent,
 };
-use std::fmt;
+use std::{
+    error, fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 /// A mock span.
 ///
@@ -104,6 +110,7 @@ use std::fmt;
 /// [`subscriber`]: mod@crate::subscriber
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct ExpectedSpan {
+    pub(crate) id: Option<ExpectedId>,
     pub(crate) metadata: ExpectedMetadata,
 }
 
@@ -135,6 +142,24 @@ where
     I: Into<String>,
 {
     expect::span().named(name)
+}
+
+/// A mock span ID.
+///
+/// This ID makes it possible to link together calls to different
+/// [`MockSubscriber`] span methods that take an [`ExpectedSpan`] in
+/// addition to those that take a [`NewSpan`].
+///
+/// Use [`expect::id`] to construct a new, unset `ExpectedId`.
+///
+/// For more details on how to use this struct, see the documentation
+/// on [`ExpectedSpan::with_id`].
+///
+/// [`expect::id`]: fn@crate::expect::id
+/// [`MockSubscriber`]: struct@crate::subscriber::MockSubscriber
+#[derive(Clone, Default)]
+pub struct ExpectedId {
+    inner: Arc<AtomicU64>,
 }
 
 impl ExpectedSpan {
@@ -188,6 +213,100 @@ impl ExpectedSpan {
                 name: Some(name.into()),
                 ..self.metadata
             },
+            ..self
+        }
+    }
+
+    /// Sets the `ID` to expect when matching a span.
+    ///
+    /// The [`ExpectedId`] can be used to differentiate spans that are
+    /// otherwise identical. An [`ExpectedId`] needs to be attached to
+    /// an `ExpectedSpan` or [`NewSpan`] which is passed to
+    /// [`MockSubscriber::new_span`]. The same [`ExpectedId`] can then
+    /// be used to match the exact same span when passed to
+    /// [`MockSubscriber::enter`], [`MockSubscriber::exit`], and
+    /// [`MockSubscriber::drop_span`].
+    ///
+    /// This is especially useful when `tracing-mock` is being used to
+    /// test the traces being generated within your own crate, in which
+    /// case you may need to distinguish between spans which have
+    /// identical metadata but different field values, which can
+    /// otherwise only be checked in [`MockSubscriber::new_span`].
+    ///
+    /// # Examples
+    ///
+    /// Here we expect that the span that is created first is entered
+    /// second:
+    ///
+    /// ```
+    /// use tracing_mock::{subscriber, expect};
+    /// let id1 = expect::id();
+    /// let span1 = expect::span().named("span").with_id(id1.clone());
+    /// let id2 = expect::id();
+    /// let span2 = expect::span().named("span").with_id(id2.clone());
+    ///
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .new_span(span1.clone())
+    ///     .new_span(span2.clone())
+    ///     .enter(span2)
+    ///     .enter(span1)
+    ///     .run_with_handle();
+    ///
+    /// tracing::subscriber::with_default(subscriber, || {
+    ///     fn create_span() -> tracing::Span {
+    ///         tracing::info_span!("span")
+    ///     }
+    ///
+    ///     let span1 = create_span();
+    ///     let span2 = create_span();
+    ///
+    ///     let _guard2 = span2.enter();
+    ///     let _guard1 = span1.enter();
+    /// });
+    ///
+    /// handle.assert_finished();
+    /// ```
+    ///
+    /// If the order that the spans are entered changes, the test will
+    /// fail:
+    ///
+    /// ```should_panic
+    /// use tracing_mock::{subscriber, expect};
+    /// let id1 = expect::id();
+    /// let span1 = expect::span().named("span").with_id(id1.clone());
+    /// let id2 = expect::id();
+    /// let span2 = expect::span().named("span").with_id(id2.clone());
+    ///
+    /// let (subscriber, handle) = subscriber::mock()
+    ///     .new_span(span1.clone())
+    ///     .new_span(span2.clone())
+    ///     .enter(span2)
+    ///     .enter(span1)
+    ///     .run_with_handle();
+    ///
+    /// tracing::subscriber::with_default(subscriber, || {
+    ///     fn create_span() -> tracing::Span {
+    ///         tracing::info_span!("span")
+    ///     }
+    ///
+    ///     let span1 = create_span();
+    ///     let span2 = create_span();
+    ///
+    ///     let _guard1 = span1.enter();
+    ///     let _guard2 = span2.enter();
+    /// });
+    ///
+    /// handle.assert_finished();
+    /// ```
+    ///
+    /// [`MockSubscriber::new_span`]: fn@crate::subscriber::MockSubscriber::new_span
+    /// [`MockSubscriber::enter`]: fn@crate::subscriber::MockSubscriber::enter
+    /// [`MockSubscriber::exit`]: fn@crate::subscriber::MockSubscriber::exit
+    /// [`MockSubscriber::drop_span`]: fn@crate::subscriber::MockSubscriber::drop_span
+    pub fn with_id(self, id: ExpectedId) -> Self {
+        Self {
+            id: Some(id),
+            ..self
         }
     }
 
@@ -241,6 +360,7 @@ impl ExpectedSpan {
                 level: Some(level),
                 ..self.metadata
             },
+            ..self
         }
     }
 
@@ -297,6 +417,7 @@ impl ExpectedSpan {
                 target: Some(target.into()),
                 ..self.metadata
             },
+            ..self
         }
     }
 
@@ -598,6 +719,15 @@ impl ExpectedSpan {
     pub(crate) fn check(&self, actual: &SpanState, subscriber_name: &str) {
         let meta = actual.metadata();
         let name = meta.name();
+
+        if let Some(expected_id) = &self.id {
+            expected_id.check(
+                actual.id(),
+                format_args!("span `{}`", name),
+                subscriber_name,
+            );
+        }
+
         self.metadata
             .check(meta, format_args!("span `{}`", name), subscriber_name);
     }
@@ -760,3 +890,69 @@ impl fmt::Debug for NewSpan {
         s.finish()
     }
 }
+
+impl PartialEq for ExpectedId {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.load(Ordering::Relaxed) == other.inner.load(Ordering::Relaxed)
+    }
+}
+
+impl Eq for ExpectedId {}
+
+impl ExpectedId {
+    const UNSET: u64 = 0;
+
+    pub(crate) fn new_unset() -> Self {
+        Self {
+            inner: Arc::new(AtomicU64::from(Self::UNSET)),
+        }
+    }
+
+    pub(crate) fn set(&self, span_id: u64) -> Result<(), SetActualSpanIdError> {
+        self.inner
+            .compare_exchange(Self::UNSET, span_id, Ordering::Relaxed, Ordering::Relaxed)
+            .map_err(|current| SetActualSpanIdError {
+                previous_span_id: current,
+                new_span_id: span_id,
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn check(&self, actual: u64, ctx: fmt::Arguments<'_>, subscriber_name: &str) {
+        let id = self.inner.load(Ordering::Relaxed);
+
+        assert!(
+            id != Self::UNSET,
+            "\n[{}] expected {} to have expected ID set, but it hasn't been, \
+            perhaps this `ExpectedId` wasn't used in a call to `MockSubscriber::new_span()`?",
+            subscriber_name,
+            ctx,
+        );
+
+        assert_eq!(
+            id, actual,
+            "\n[{}] expected {} to have ID `{}`, but it has `{}` instead",
+            subscriber_name, ctx, id, actual,
+        );
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SetActualSpanIdError {
+    previous_span_id: u64,
+    new_span_id: u64,
+}
+
+impl fmt::Display for SetActualSpanIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Could not set `ExpecedId` to {new}, \
+            it had already been set to {previous}",
+            new = self.new_span_id,
+            previous = self.previous_span_id
+        )
+    }
+}
+
+impl error::Error for SetActualSpanIdError {}
