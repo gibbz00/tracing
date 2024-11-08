@@ -42,8 +42,24 @@ pub use builder::{Builder, InitError};
 
 pub use compression::Compression;
 mod compression {
+    /// Compress rotated log files in [`RollingFileAppender`] by setting [`Builder::compression`].
+    ///
+    /// Log files will on rollover be compressed to a new file whose name
+    /// is the original file name appended with an extension specific to the
+    /// compression variant. Uncompressed log files are then deleted once
+    /// written successfully into their compressed counterpart.
+    ///
+    /// Note each compression variant is feature gated.
+    ///
+    /// [`RollingFileAppender`]: super::RollingFileAppender
+    /// [`Builder::compression`]: super::Builder::compression
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub enum Compression {
+        /// Compress rotated log files with gzip.
+        ///
+        /// Compressed log file names have the `.gz` appended to them.
+        ///
+        /// Use this variant by enabling the `gzip` feature.
         #[cfg(feature = "gzip")]
         Gzip,
     }
