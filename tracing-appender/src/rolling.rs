@@ -28,6 +28,7 @@
 //! ```
 use crate::sync::{RwLock, RwLockReadGuard};
 use std::{
+    borrow::Cow,
     fmt::{self, Debug},
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -38,6 +39,30 @@ use time::{format_description, Date, Duration, OffsetDateTime, Time};
 
 mod builder;
 pub use builder::{Builder, InitError};
+
+pub use compression::Compression;
+mod compression {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum Compression {
+        #[cfg(feature = "gzip")]
+        Gzip,
+    }
+
+    impl Compression {
+        pub(crate) fn file_extension(&self) -> &'static str {
+            match self {
+                #[cfg(feature = "gzip")]
+                Compression::Gzip => "gz",
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InnerFileWriter {
+    file: File,
+    file_path: PathBuf,
+}
 
 /// A file appender with the ability to rotate log files at a fixed schedule.
 ///
@@ -85,7 +110,7 @@ pub use builder::{Builder, InitError};
 /// [`MakeWriter`]: tracing_subscriber::fmt::writer::MakeWriter
 pub struct RollingFileAppender {
     state: Inner,
-    writer: RwLock<File>,
+    writer: RwLock<InnerFileWriter>,
     #[cfg(test)]
     now: Box<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
@@ -97,7 +122,7 @@ pub struct RollingFileAppender {
 /// [writer]: std::io::Write
 /// [`MakeWriter`]: tracing_subscriber::fmt::writer::MakeWriter
 #[derive(Debug)]
-pub struct RollingWriter<'a>(RwLockReadGuard<'a, File>);
+pub struct RollingWriter<'a>(RwLockReadGuard<'a, InnerFileWriter>);
 
 #[derive(Debug)]
 struct Inner {
@@ -106,6 +131,7 @@ struct Inner {
     log_filename_suffix: Option<String>,
     date_format: Vec<format_description::FormatItem<'static>>,
     rotation: Rotation,
+    compression: Option<Compression>,
     next_date: AtomicUsize,
     max_files: Option<usize>,
 }
@@ -186,11 +212,12 @@ impl RollingFileAppender {
 
     fn from_builder(builder: &Builder, directory: impl AsRef<Path>) -> Result<Self, InitError> {
         let Builder {
-            ref rotation,
-            ref prefix,
-            ref suffix,
-            ref max_files,
-        } = builder;
+            rotation,
+            prefix,
+            suffix,
+            max_files,
+            compression,
+        } = &builder;
         let directory = directory.as_ref().to_path_buf();
         let now = OffsetDateTime::now_utc();
         let (state, writer) = Inner::new(
@@ -200,6 +227,7 @@ impl RollingFileAppender {
             prefix.clone(),
             suffix.clone(),
             *max_files,
+            *compression,
         )?;
         Ok(Self {
             state,
@@ -228,11 +256,11 @@ impl io::Write for RollingFileAppender {
             debug_assert!(_did_cas, "if we have &mut access to the appender, no other thread can have advanced the timestamp...");
             self.state.refresh_writer(now, writer);
         }
-        writer.write(buf)
+        writer.file.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.get_mut().flush()
+        self.writer.get_mut().file.flush()
     }
 }
 
@@ -507,11 +535,11 @@ impl Rotation {
 
 impl io::Write for RollingWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(buf)
+        (&self.0.file).write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
+        (&self.0.file).flush()
     }
 }
 
@@ -525,7 +553,8 @@ impl Inner {
         log_filename_prefix: Option<String>,
         log_filename_suffix: Option<String>,
         max_files: Option<usize>,
-    ) -> Result<(Self, RwLock<File>), builder::InitError> {
+        compression: Option<Compression>,
+    ) -> Result<(Self, RwLock<InnerFileWriter>), builder::InitError> {
         let log_directory = directory.as_ref().to_path_buf();
         let date_format = rotation.date_format();
         let next_date = rotation.next_date(&now);
@@ -542,6 +571,7 @@ impl Inner {
             ),
             rotation,
             max_files,
+            compression,
         };
         let filename = inner.join_date(&now);
         let writer = RwLock::new(create_writer(inner.log_directory.as_ref(), &filename)?);
@@ -556,7 +586,7 @@ impl Inner {
         match (
             &self.rotation,
             &self.log_filename_prefix,
-            &self.log_filename_suffix,
+            &self.file_name_suffix(),
         ) {
             (&Rotation::NEVER, Some(filename), None) => filename.to_string(),
             (&Rotation::NEVER, Some(filename), Some(suffix)) => format!("{}.{}", filename, suffix),
@@ -589,8 +619,8 @@ impl Inner {
                     }
                 }
 
-                if let Some(suffix) = &self.log_filename_suffix {
-                    if !filename.ends_with(suffix) {
+                if let Some(suffix) = &self.file_name_suffix() {
+                    if !filename.ends_with(suffix.as_ref()) {
                         return None;
                     }
                 }
@@ -634,19 +664,60 @@ impl Inner {
         }
     }
 
-    fn refresh_writer(&self, now: OffsetDateTime, file: &mut File) {
-        let filename = self.join_date(&now);
-
+    fn refresh_writer(&self, now: OffsetDateTime, inner_file_writer: &mut InnerFileWriter) {
         if let Some(max_files) = self.max_files {
             self.prune_old_logs(max_files);
         }
 
-        match create_writer(&self.log_directory, &filename) {
-            Ok(new_file) => {
-                if let Err(err) = file.flush() {
+        let new_filename = self.join_date(&now);
+        match create_writer(&self.log_directory, &new_filename) {
+            Ok(new_inner_file_writer) => {
+                if let Err(err) = inner_file_writer.file.flush() {
                     eprintln!("Couldn't flush previous writer: {}", err);
                 }
-                *file = new_file;
+
+                let previous_inner_file_writer =
+                    std::mem::replace(inner_file_writer, new_inner_file_writer);
+
+                if let Some(compression) = self.compression {
+                    let compressed_file_path = previous_inner_file_writer
+                        .file_path
+                        .join(compression.file_extension());
+
+                    let compressed_file = match File::create(&compressed_file_path) {
+                        Ok(file) => file,
+                        Err(err) => {
+                            return eprintln!(
+                                "Unable to create {} for writing compressed logs: {}",
+                                compressed_file_path.display(),
+                                err
+                            );
+                        }
+                    };
+
+                    let previous_file_reader =
+                        std::io::BufReader::new(previous_inner_file_writer.file);
+
+                    let compression_result = match compression {
+                        #[cfg(feature = "gzip")]
+                        Compression::Gzip => {
+                            let mut gzip_encoder = flate2::write::GzEncoder::new(
+                                compressed_file,
+                                flate2::Compression::default(),
+                            );
+
+                            gzip_encoder.write_all(previous_file_reader.buffer())
+                        }
+                    };
+
+                    if let Err(err) = compression_result {
+                        eprintln!(
+                            "Failed to compress log file into {}: {}",
+                            compressed_file_path.display(),
+                            err
+                        )
+                    }
+                }
             }
             Err(err) => eprintln!("Couldn't create writer for logs: {}", err),
         }
@@ -684,24 +755,40 @@ impl Inner {
             .compare_exchange(current, next_date, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+
+    fn file_name_suffix(&self) -> Option<Cow<'_, str>> {
+        match (&self.log_filename_suffix, self.compression) {
+            (None, Some(compression)) => Some(Cow::Borrowed(compression.file_extension())),
+            (Some(file_suffix), None) => Some(Cow::Borrowed(file_suffix)),
+            (Some(file_suffix), Some(compression)) => Some(Cow::Owned(format!(
+                "{}.{}",
+                file_suffix,
+                compression.file_extension()
+            ))),
+            (None, None) => None,
+        }
+    }
 }
 
-fn create_writer(directory: &Path, filename: &str) -> Result<File, InitError> {
+fn create_writer(directory: &Path, filename: &str) -> Result<InnerFileWriter, InitError> {
     let path = directory.join(filename);
     let mut open_options = OpenOptions::new();
     open_options.append(true).create(true);
 
-    let new_file = open_options.open(path.as_path());
+    let mut new_file = open_options.open(path.as_path());
     if new_file.is_err() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(InitError::ctx("failed to create log directory"))?;
-            return open_options
-                .open(path)
-                .map_err(InitError::ctx("failed to create initial log file"));
+            new_file = open_options.open(&path);
         }
     }
 
-    new_file.map_err(InitError::ctx("failed to create initial log file"))
+    new_file
+        .map(|file| InnerFileWriter {
+            file,
+            file_path: path,
+        })
+        .map_err(InitError::ctx("failed to create initial log file"))
 }
 
 #[cfg(test)]
@@ -829,6 +916,7 @@ mod test {
                 prefix.map(ToString::to_string),
                 suffix.map(ToString::to_string),
                 None,
+                None,
             )
             .unwrap();
             let path = inner.join_date(&now);
@@ -941,6 +1029,7 @@ mod test {
             Some("test_make_writer".to_string()),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1023,6 +1112,7 @@ mod test {
             Some("test_max_log_files".to_string()),
             None,
             Some(2),
+            None,
         )
         .unwrap();
 

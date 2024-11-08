@@ -20,11 +20,17 @@ keywords = ["logging", "tracing", "file-appender", "non-blocking-writer"]
 edition = "2018"
 rust-version = "1.53.0"
 
+[features]
+gzip = ["dep:flate2"]
+
 [dependencies]
 crossbeam-channel = "0.5.5"
 time = { version = "0.3.2", default-features = false, features = ["formatting", "parsing"] }
 parking_lot = { optional = true, version = "0.12.1" }
 thiserror = "1.0.31"
+
+# feature: gzip
+flate2 = { version = "1", optional = true }
 
 [dependencies.tracing-subscriber]
 path = "../tracing-subscriber"

@@ -1,4 +1,4 @@
-use super::{RollingFileAppender, Rotation};
+use super::{Compression, RollingFileAppender, Rotation};
 use std::{io, path::Path};
 use thiserror::Error;
 
@@ -11,6 +11,7 @@ pub struct Builder {
     pub(super) prefix: Option<String>,
     pub(super) suffix: Option<String>,
     pub(super) max_files: Option<usize>,
+    pub(super) compression: Option<Compression>,
 }
 
 /// Errors returned by [`Builder::build`].
@@ -36,17 +37,19 @@ impl Builder {
     ///
     /// The default values for the builder are:
     ///
-    /// | Parameter | Default Value | Notes |
-    /// | :-------- | :------------ | :---- |
-    /// | [`rotation`] | [`Rotation::NEVER`] | By default, log files will never be rotated. |
-    /// | [`filename_prefix`] | `""` | By default, log file names will not have a prefix. |
-    /// | [`filename_suffix`] | `""` | By default, log file names will not have a suffix. |
-    /// | [`max_log_files`] | `None` | By default, there is no limit for maximum log file count. |
+    /// | Parameter           | Default Value       | Notes                                                      |
+    /// | :--------           | :------------       | :----                                                      |
+    /// | [`rotation`]        | [`Rotation::NEVER`] | By default, log files will never be rotated.               |
+    /// | [`filename_prefix`] | `""`                | By default, log file names will not have a prefix.         |
+    /// | [`filename_suffix`] | `""`                | By default, log file names will not have a suffix.         |
+    /// | [`max_log_files`]   | `None`              | By default, there is no limit for maximum log file count.  |
+    /// | [`compression`]     | `None`              | By default, no compression is applied to rotated log files.|
     ///
     /// [`rotation`]: Self::rotation
     /// [`filename_prefix`]: Self::filename_prefix
     /// [`filename_suffix`]: Self::filename_suffix
     /// [`max_log_files`]: Self::max_log_files
+    /// [`compression`]: Self::compression
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -54,6 +57,7 @@ impl Builder {
             prefix: None,
             suffix: None,
             max_files: None,
+            compression: None,
         }
     }
 
@@ -231,6 +235,38 @@ impl Builder {
             max_files: Some(n),
             ..self
         }
+    }
+
+    /// Sets the [compression strategy] for log files.
+    ///
+    /// This is disabled by default.
+    ///
+    /// Note that this only applies to rotated log files and not to the log file
+    /// that is actively being written to. **No compression is thus applied if
+    /// there's no rotation configured.**
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn docs() {
+    /// use tracing_appender::rolling::{Rotation, RollingFileAppender, Compression};
+    ///
+    /// let appender = RollingFileAppender::builder()
+    ///     .rotation(Rotation::HOURLY) // rotate log files once every hour
+    ///     .compression(Compression::Gzip) // rotated log files are compressed using gzip
+    ///     // ...
+    ///     .build("/var/log")
+    ///     .expect("failed to initialize rolling file appender");
+    ///
+    /// # drop(appender)
+    /// # }
+    /// ```
+    ///
+    /// [compression strategy]: Compression
+    #[must_use]
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
+        self
     }
 
     /// Builds a new [`RollingFileAppender`] with the configured parameters,
